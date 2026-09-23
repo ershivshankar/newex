@@ -255,9 +255,22 @@ function relayToMobile(fromSocket, event, data) {
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/devices', require('./routes/devices'));
 
+// ─── NEON DB CLIENT SETUP ───────────────────────────────────────────────────
+const { neon } = require('@neondatabase/serverless');
+const DATABASE_URL = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_vRJDWPhb5X4C@ep-old-scene-b3mo21nl-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require";
+let sqlNeon = null;
+try {
+  if (DATABASE_URL) {
+    sqlNeon = neon(DATABASE_URL);
+    console.log('✅ NeonDB client initialized');
+  }
+} catch (e) {
+  console.warn('⚠️ NeonDB client init warning:', e.message);
+}
+
 // ─── TOKEN VERIFICATION (Extension Login) ─────────────────────────────────────
 // POST /api/auth/verify-token  { token: "123456" }
-// Checks if the 6-digit token exists and is approved in AccessToken collection
+// Checks if token exists and is approved in NeonDB (or fallback to MongoDB)
 app.post('/api/auth/verify-token', async (req, res) => {
   try {
     const { token } = req.body;
@@ -266,43 +279,49 @@ app.post('/api/auth/verify-token', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Token is required.' });
     }
 
-    // ── Wait for MongoDB to be ready (handles cold-start race condition) ──────
-    // On free Render, server boots fast but MongoDB connects ~2-4s later.
-    // We retry for up to 6 seconds before giving up.
-    const waitForDB = () => new Promise((resolve) => {
-      if (mongoose.connection.readyState === 1) return resolve(true);
-      let attempts = 0;
-      const interval = setInterval(() => {
-        attempts++;
-        if (mongoose.connection.readyState === 1) {
-          clearInterval(interval);
-          resolve(true);
-        } else if (attempts >= 12) { // 12 x 500ms = 6 seconds
-          clearInterval(interval);
-          resolve(false);
+    const cleanToken = token.trim();
+
+    // ── 1. Check NeonDB first ───────────────────────────────────────────────
+    if (sqlNeon) {
+      try {
+        const rows = await sqlNeon`
+          SELECT * FROM access_tokens
+          WHERE token = ${cleanToken} OR token = ${cleanToken.toUpperCase()}
+          LIMIT 1
+        `;
+
+        if (rows && rows.length > 0) {
+          const record = rows[0];
+          if (record.status === 'revoked') {
+            return res.status(403).json({ success: false, error: 'Token has been revoked. Contact admin.' });
+          }
+          // Update last_seen asynchronously
+          sqlNeon`UPDATE access_tokens SET last_seen = NOW() WHERE id = ${record.id}`.catch(() => {});
+          console.log(`[verify-token] ✅ Approved via NeonDB: ${cleanToken} — ${record.label || ''}`);
+          return res.json({ success: true, label: record.label || '', token: record.token });
         }
-      }, 500);
-    });
-
-    const dbReady = await waitForDB();
-
-    if (!dbReady) {
-      console.warn('[verify-token] MongoDB not ready after 6s — rejecting');
-      return res.status(503).json({ success: false, error: 'Server is starting up. Please try again in a few seconds.' });
+      } catch (neonErr) {
+        console.warn('[verify-token] NeonDB query error (falling back to Mongo):', neonErr.message);
+      }
     }
 
-    const AccessToken = require('./models/AccessToken');
-    const record = await AccessToken.findOne({ token: token.trim() });
+    // ── 2. Fallback to MongoDB if not found in NeonDB or NeonDB down ─────────
+    if (mongoose.connection.readyState === 1) {
+      const AccessToken = require('./models/AccessToken');
+      const record = await AccessToken.findOne({
+        $or: [{ token: cleanToken }, { token: cleanToken.toUpperCase() }]
+      });
 
-    if (!record) {
-      return res.status(403).json({ success: false, error: 'Invalid token. Contact admin.' });
-    }
-    if (record.status === 'revoked') {
-      return res.status(403).json({ success: false, error: 'Token has been revoked. Contact admin.' });
+      if (record) {
+        if (record.status === 'revoked') {
+          return res.status(403).json({ success: false, error: 'Token has been revoked. Contact admin.' });
+        }
+        console.log(`[verify-token] ✅ Approved via MongoDB: ${cleanToken} — ${record.label || ''}`);
+        return res.json({ success: true, label: record.label || '', token: record.token });
+      }
     }
 
-    console.log(`[verify-token] ✅ Approved: ${token} — ${record.label || ''}`);
-    res.json({ success: true, label: record.label || '' });
+    return res.status(403).json({ success: false, error: 'Invalid token. Contact admin.' });
 
   } catch (err) {
     console.error('[verify-token] ❌ Error:', err.message);
@@ -317,10 +336,20 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin123';
 app.get('/api/admin/tokens', async (req, res) => {
   if (req.query.secret !== ADMIN_SECRET) return res.status(401).json({ error: 'Unauthorized' });
   try {
-    if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'DB not connected' });
-    const AccessToken = require('./models/AccessToken');
-    const tokens = await AccessToken.find().sort({ createdAt: -1 });
-    res.json({ success: true, tokens });
+    if (sqlNeon) {
+      try {
+        const rows = await sqlNeon`SELECT * FROM access_tokens ORDER BY created_at DESC`;
+        return res.json({ success: true, source: 'neondb', tokens: rows });
+      } catch (e) {
+        console.warn('NeonDB list error:', e.message);
+      }
+    }
+    if (mongoose.connection.readyState === 1) {
+      const AccessToken = require('./models/AccessToken');
+      const tokens = await AccessToken.find().sort({ createdAt: -1 });
+      return res.json({ success: true, source: 'mongodb', tokens });
+    }
+    res.status(503).json({ error: 'No database available' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -331,14 +360,37 @@ app.get('/api/admin/tokens', async (req, res) => {
 app.post('/api/admin/tokens', async (req, res) => {
   const { secret, token, label } = req.body;
   if (secret !== ADMIN_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+  if (!token) return res.status(400).json({ error: 'Token required' });
+  const cleanToken = token.trim();
+
   try {
-    if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'DB not connected' });
-    const AccessToken = require('./models/AccessToken');
-    const existing = await AccessToken.findOne({ token: token.toUpperCase().trim() });
-    if (existing) return res.status(409).json({ error: 'Token already exists' });
-    const newToken = await AccessToken.create({ token: token.toUpperCase().trim(), label: label || '', status: 'approved' });
-    console.log(`[admin] ✅ Token created: ${newToken.token} (${label})`);
-    res.json({ success: true, token: newToken });
+    if (sqlNeon) {
+      try {
+        await sqlNeon`
+          INSERT INTO access_tokens (token, label, status)
+          VALUES (${cleanToken}, ${label || ''}, 'approved')
+          ON CONFLICT (token) DO UPDATE SET status = 'approved', label = ${label || ''}
+        `;
+        console.log(`[admin] ✅ Token saved in NeonDB: ${cleanToken} (${label || ''})`);
+        return res.json({ success: true, source: 'neondb', token: cleanToken, label: label || '' });
+      } catch (e) {
+        console.warn('NeonDB insert error:', e.message);
+      }
+    }
+    if (mongoose.connection.readyState === 1) {
+      const AccessToken = require('./models/AccessToken');
+      const existing = await AccessToken.findOne({ token: cleanToken });
+      if (existing) {
+        existing.status = 'approved';
+        existing.label = label || existing.label;
+        await existing.save();
+        return res.json({ success: true, source: 'mongodb', token: existing });
+      }
+      const newToken = await AccessToken.create({ token: cleanToken, label: label || '', status: 'approved' });
+      console.log(`[admin] ✅ Token created in MongoDB: ${newToken.token} (${label})`);
+      return res.json({ success: true, source: 'mongodb', token: newToken });
+    }
+    res.status(503).json({ error: 'No database available' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -348,15 +400,20 @@ app.post('/api/admin/tokens', async (req, res) => {
 // Query: ?secret=admin123
 app.delete('/api/admin/tokens/:token', async (req, res) => {
   if (req.query.secret !== ADMIN_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+  const cleanToken = req.params.token.trim();
   try {
-    if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'DB not connected' });
-    const AccessToken = require('./models/AccessToken');
-    await AccessToken.findOneAndUpdate(
-      { token: req.params.token.toUpperCase() },
-      { status: 'revoked' }
-    );
-    console.log(`[admin] 🚫 Token revoked: ${req.params.token}`);
-    res.json({ success: true, message: 'Token revoked' });
+    if (sqlNeon) {
+      await sqlNeon`UPDATE access_tokens SET status = 'revoked' WHERE token = ${cleanToken} OR token = ${cleanToken.toUpperCase()}`;
+      console.log(`[admin] 🚫 Token revoked in NeonDB: ${cleanToken}`);
+    }
+    if (mongoose.connection.readyState === 1) {
+      const AccessToken = require('./models/AccessToken');
+      await AccessToken.findOneAndUpdate(
+        { $or: [{ token: cleanToken }, { token: cleanToken.toUpperCase() }] },
+        { status: 'revoked' }
+      );
+    }
+    res.json({ success: true, message: `Token ${cleanToken} revoked` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
